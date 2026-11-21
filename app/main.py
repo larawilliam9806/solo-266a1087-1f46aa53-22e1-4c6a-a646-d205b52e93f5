@@ -5,6 +5,7 @@
 - GET    /documents/{doc_id}                         版本查询：正文 + 有效标注区间 + 待复核标注
 - POST   /documents/{doc_id}/corrections             应用一笔勘误，返回勘误号
 - POST   /documents/{doc_id}/corrections/{n}/retract 按号撤回（冲突则 409 并保留现版）
+- POST   /documents/{doc_id}/seal                   封存：截止号及以前勘误定稿、清理无用文本
 - GET    /documents/{doc_id}/corrections             勘误流水
 - GET    /documents/{doc_id}/entities                实体检索（kind / q 过滤）
 - GET    /documents/{doc_id}/entities/{number}       单个实体
@@ -80,6 +81,11 @@ class CorrectionIn(BaseModel):
     text: str = Field(default="", description="替换文本；区间为空即插入，文本为空即删除")
 
 
+class SealIn(BaseModel):
+    revision: int = Field(ge=0, description="所见版号，须与当前版号一致")
+    cutoff: int = Field(ge=1, description="截止勘误号：该号及以前的勘误封存")
+
+
 # ---------------------------------------------------------------- 异常映射
 
 @app.exception_handler(service.NotFoundError)
@@ -99,6 +105,12 @@ async def conflict_handler(request, exc: service.ConflictError):
         status_code=409,
         content={"detail": str(exc), "conflicts": exc.conflicts},
     )
+
+
+@app.exception_handler(service.StaleRevisionError)
+async def stale_revision_handler(request, exc):
+    # 版号过期：封存线与数据保持原样
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
 # ---------------------------------------------------------------- 路由
@@ -134,6 +146,12 @@ def apply_correction(doc_id: int, payload: CorrectionIn):
 @app.post("/documents/{doc_id}/corrections/{number}/retract")
 def retract_correction(doc_id: int, number: int):
     return _write(service.retract_correction, doc_id, number)
+
+
+@app.post("/documents/{doc_id}/seal")
+def seal_document(doc_id: int, payload: SealIn):
+    """封存：截止号及以前的勘误定稿、禁止撤回，清理不再被引用的文字。"""
+    return _write(service.seal_document, doc_id, payload.revision, payload.cutoff)
 
 
 @app.get("/documents/{doc_id}/corrections")

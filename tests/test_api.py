@@ -43,6 +43,11 @@ def retract(client, doc, number):
     return client.post(f"/documents/{doc}/corrections/{number}/retract")
 
 
+def seal(client, doc, revision, cutoff):
+    return client.post(f"/documents/{doc}/seal",
+                       json={"revision": revision, "cutoff": cutoff})
+
+
 def version(client, doc):
     r = client.get(f"/documents/{doc}")
     assert r.status_code == 200, r.text
@@ -294,3 +299,120 @@ def test_corrections_listing(client):
     assert rows[0]["kind"] == "insert" and rows[0]["status"] == "active"
     assert rows[1]["touches_corrections"] == [1]
     assert rows[1]["deleted_text"] == "Y"
+
+
+# ---------------------------------------------------------------- 封存
+
+def test_seal_marks_and_blocks_retract(client):
+    doc = import_doc(client, "ABCDEFG", entities=[])
+    correct(client, doc, 2, 4, "XY")             # 1: ABXYEFG
+    r = seal(client, doc, 1, 1)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sealed_through"] == 1
+    assert body["revision"] == 2                 # 封存后版号递增
+    assert body["cleared_bytes"] == 2            # 被替换文本副本 "CD"
+    rows = client.get(f"/documents/{doc}/corrections").json()
+    assert rows[0]["sealed"] is True
+    assert rows[0]["status"] == "active"         # 原状态保留
+    assert rows[0]["deleted_text"] == ""         # 被替换文本副本已清
+    r = retract(client, doc, 1)
+    assert r.status_code == 400                  # 已封存，禁止撤回
+    v = version(client, doc)
+    assert v["text"] == "ABXYEFG"                # 现稿不变
+    assert v["revision"] == 2
+
+
+def test_seal_requires_existing_cutoff(client):
+    doc = import_doc(client, "ABC", entities=[])
+    correct(client, doc, 0, 1, "x")
+    assert seal(client, doc, 1, 99).status_code == 404
+    assert seal(client, doc, 1, 2).status_code == 404
+    assert client.post("/documents/999/seal",
+                       json={"revision": 0, "cutoff": 1}).status_code == 404
+
+
+def test_seal_stale_revision_keeps_everything(client):
+    doc = import_doc(client, "ABCDEFG", entities=[])
+    correct(client, doc, 2, 4, "XY")             # rev 1
+    r = seal(client, doc, 0, 1)                  # 版号过期
+    assert r.status_code == 409
+    rows = client.get(f"/documents/{doc}/corrections").json()
+    assert rows[0]["sealed"] is False            # 数据保持原样
+    assert rows[0]["deleted_text"] == "CD"
+    assert version(client, doc)["revision"] == 1
+    r = seal(client, doc, 1, 1)                  # 用正确版号可重试
+    assert r.status_code == 200
+
+
+def test_seal_line_only_advances(client):
+    doc = import_doc(client, "ABCDEFG", entities=[])
+    correct(client, doc, 2, 4, "XY")             # 1
+    correct(client, doc, 0, 0, "Z")              # 2
+    assert seal(client, doc, 2, 2).status_code == 200
+    assert seal(client, doc, 3, 2).status_code == 400   # 不能原地封存
+    assert seal(client, doc, 3, 1).status_code == 400   # 不能倒退
+    assert version(client, doc)["revision"] == 3        # 失败不递增版号
+
+
+def test_seal_compacts_unreferenced_text(client):
+    doc = import_doc(client, "AB", entities=[])
+    correct(client, doc, 1, 1, "甲乙丙丁")        # 1: A甲乙丙丁B
+    correct(client, doc, 2, 4)                   # 2: 删掉乙丙 -> A甲丁B
+    r = seal(client, doc, 2, 2)
+    assert r.status_code == 200, r.text
+    # 勘误 1 写入的“乙丙”不再被引用（勘误 2 一并封存，还原材料清空）：
+    # 甲乙丙丁(12B)->甲丁(6B) 清 6B；勘误 2 的被替换文本副本“乙丙”清 6B
+    assert r.json()["cleared_bytes"] == 12
+    rows = client.get(f"/documents/{doc}/corrections").json()
+    assert rows[0]["text"] == "甲丁"              # 写入文字已压缩
+    assert rows[1]["deleted_text"] == ""
+    assert version(client, doc)["text"] == "A甲丁B"   # 现稿不变
+    assert retract(client, doc, 2).status_code == 400
+    assert retract(client, doc, 1).status_code == 400
+
+
+def test_seal_keeps_text_referenced_by_later_revert_material(client):
+    doc = import_doc(client, "AB", entities=[])
+    correct(client, doc, 1, 1, "XYZW")           # 1: AXYZWB
+    correct(client, doc, 2, 4)                   # 2: 删 YZ（仍生效，还原材料引用 1 的文字）
+    r = seal(client, doc, 2, 1)                  # 只封存勘误 1
+    assert r.status_code == 200, r.text
+    assert r.json()["cleared_bytes"] == 0        # XYZW 全部被现稿/勘误 2 还原材料引用
+    rows = client.get(f"/documents/{doc}/corrections").json()
+    assert rows[0]["text"] == "XYZW"
+    assert rows[1]["sealed"] is False
+    # 截止号以后的勘误仍按原规则撤回，结果与封存前相同
+    assert retract(client, doc, 2).status_code == 200
+    assert version(client, doc)["text"] == "AXYZWB"
+    assert retract(client, doc, 1).status_code == 400   # 勘误 1 已封存
+    # 再次封存推进到 2：勘误 2 已撤回，其被替换文本副本“YZ”清 2B
+    r = seal(client, doc, 4, 2)
+    assert r.status_code == 200
+    assert r.json()["cleared_bytes"] == 2
+
+
+def test_seal_preserves_entity_states(client):
+    doc = import_doc(client)
+    correct(client, doc, 5, 6, "津")             # 触及地名标注
+    before = version(client, doc)
+    r = seal(client, doc, 1, 1)
+    assert r.status_code == 200, r.text
+    after = version(client, doc)
+    assert after["text"] == before["text"]
+    assert after["valid_entities"] == before["valid_entities"]
+    assert after["pending_entities"] == before["pending_entities"]
+    assert after["revision"] == before["revision"] + 1
+
+
+def test_seal_then_corrections_continue(client):
+    doc = import_doc(client, "ABCDEFG", entities=[])
+    correct(client, doc, 2, 4, "XY")             # 1: ABXYEFG
+    assert seal(client, doc, 1, 1).status_code == 200
+    n = correct(client, doc, 2, 4, "Q")          # 2: 改掉封存的 XY（记触及但不影响）
+    assert n == 2
+    assert version(client, doc)["text"] == "ABQEFG"
+    assert retract(client, doc, 2).status_code == 200   # 后续勘误照常撤回
+    assert version(client, doc)["text"] == "ABXYEFG"
+    docs = client.get("/documents").json()
+    assert docs[0]["sealed_through"] == 1

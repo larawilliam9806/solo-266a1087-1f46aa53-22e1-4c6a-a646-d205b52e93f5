@@ -175,5 +175,29 @@ class TouchSpanTest(unittest.TestCase):
         self.assertFalse(T(8, 8, True, 4, 8))
 
 
+class CompactSpansTest(unittest.TestCase):
+    def test_merge_disjoint_and_remap(self):
+        mapped = engine.compact_spans([(3, 4), (0, 1)], 5)
+        self.assertEqual(mapped, [(0, 1, 0), (3, 4, 1)])
+        self.assertEqual(engine.remap_offset(mapped, 0), 0)
+        self.assertEqual(engine.remap_offset(mapped, 1), 1)
+        self.assertEqual(engine.remap_offset(mapped, 3), 1)
+        self.assertEqual(engine.remap_offset(mapped, 4), 2)
+
+    def test_overlapping_and_adjacent_merge(self):
+        self.assertEqual(engine.compact_spans([(0, 3), (2, 5)], 6), [(0, 5, 0)])
+        self.assertEqual(engine.compact_spans([(0, 2), (2, 4)], 6), [(0, 4, 0)])
+
+    def test_empty_and_clamped(self):
+        self.assertEqual(engine.compact_spans([], 3), [])
+        self.assertEqual(engine.compact_spans([(-2, 1), (2, 9)], 4),
+                         [(0, 1, 0), (2, 4, 1)])
+
+    def test_unmapped_offset_raises(self):
+        mapped = engine.compact_spans([(0, 1)], 3)
+        with self.assertRaises(engine.InvariantError):
+            engine.remap_offset(mapped, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

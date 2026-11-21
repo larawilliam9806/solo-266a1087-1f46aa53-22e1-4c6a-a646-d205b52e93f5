@@ -131,6 +131,40 @@ def revert_edit(pieces: list[dict], deleted: list[dict], src: int, kind: str) ->
     return pieces[:idxs[0]] + [dict(d) for d in deleted] + pieces[idxs[-1] + 1:]
 
 
+def compact_spans(spans: list[tuple[int, int]], length: int) -> list[tuple[int, int, int]]:
+    """把仍被引用的字符区间合并，并给出它们在压缩后文本中的新起点。
+
+    返回 [(旧起点, 旧终点, 新起点), ...]，按旧起点升序，区间互不相交也不相邻。
+    压缩后的文本 = 按返回顺序拼接各 [旧起点, 旧终点) 片段。
+    """
+    merged: list[list[int]] = []
+    for a, b in sorted(spans):
+        a, b = max(0, a), min(length, b)
+        if a >= b:
+            continue
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    out: list[tuple[int, int, int]] = []
+    pos = 0
+    for a, b in merged:
+        out.append((a, b, pos))
+        pos += b - a
+    return out
+
+
+def remap_offset(mapped: list[tuple[int, int, int]], x: int) -> int:
+    """旧偏移 x 在压缩后文本中的新偏移。
+
+    x 必须是某个保留区间的端点（含右端点），否则说明引用统计不完整。
+    """
+    for a, b, na in mapped:
+        if a <= x <= b:
+            return na + (x - a)
+    raise InvariantError(f"offset {x} not preserved by compaction")
+
+
 def render(pieces: list[dict], original: str, corr_texts: dict[int, str]) -> str:
     """由片段表拼出当前版正文。corr_texts: 勘误号 -> 该笔写入的文本。"""
     out = []

@@ -25,6 +25,10 @@ class ConflictError(Exception):
         self.conflicts = conflicts
 
 
+class StaleRevisionError(Exception):
+    """所见版号与当前版号不一致（版号过期）。"""
+
+
 # ---------------------------------------------------------------- 导入
 
 def import_document(conn: sqlite3.Connection, text: str, entities: list[dict]) -> dict:
@@ -130,6 +134,8 @@ def retract_correction(conn: sqlite3.Connection, doc_id: int, number: int) -> di
         raise NotFoundError(f"勘误号不存在: {number}")
     if row["status"] == "retracted":
         raise ValidationError(f"勘误 {number} 已撤回")
+    if row["sealed"]:
+        raise ValidationError(f"勘误 {number} 已封存，禁止撤回")
 
     conflicts = db.active_conflicts_against(conn, doc_id, number)
     if conflicts:
@@ -152,6 +158,122 @@ def retract_correction(conn: sqlite3.Connection, doc_id: int, number: int) -> di
     )
     revision = _bump_revision(conn, doc_id)
     return {"retracted": number, "revision": revision}
+
+
+# ---------------------------------------------------------------- 封存
+
+def seal_document(conn: sqlite3.Connection, doc_id: int,
+                  revision: int, cutoff: int) -> dict:
+    """封存截止号及以前的勘误：定稿、禁止撤回、清理不再被引用的文字。
+
+    - 截止号须存在，且必须大于当前封存线（每次封存只能推进）。
+    - 截止号及以前的勘误保留原号与原状态，标为已封存；清掉它们保存的
+      被替换文本副本（deleted_text 与还原材料 deleted_pieces）。
+    - 这些勘误写入的文字中，现稿片段表或截止号以后未撤回勘误的还原材料
+      仍引用的字符保留，其余字符清除；所有引用偏移同步重映射，
+      因此封存前后现稿与标注状态不变，后续勘误仍按原规则撤回。
+    - 版号过期或中途失败时抛出异常，由调用方回滚，封存线与数据保持原样。
+    成功后递增版号，返回本次清掉的勘误文本字节数（按 UTF-8 计）。
+    """
+    doc = _get_document(conn, doc_id)
+    if doc["revision"] != revision:
+        raise StaleRevisionError(
+            f"版号过期：所见版号 {revision}，当前版号 {doc['revision']}")
+    row = conn.execute(
+        "SELECT id FROM corrections WHERE document_id = ? AND number = ?",
+        (doc_id, cutoff),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"截止勘误号不存在: {cutoff}")
+    sealed_through = doc["sealed_through"]
+    if cutoff <= sealed_through:
+        raise ValidationError(
+            f"封存线只能推进：截止号 {cutoff} 须大于当前封存线 {sealed_through}")
+
+    before = get_version(conn, doc_id)
+
+    pieces = db.load_pieces(conn, doc_id)
+    rows = conn.execute(
+        "SELECT * FROM corrections WHERE document_id = ? ORDER BY number",
+        (doc_id,),
+    ).fetchall()
+    texts = {r["number"]: r["text"] for r in rows}
+
+    # 截止号及以前每笔勘误写入文字中仍被引用的字符区间：
+    # 1) 现稿片段表；2) 截止号以后未撤回勘误的还原材料
+    refs: dict[int, list[tuple[int, int]]] = {
+        r["number"]: [] for r in rows if r["number"] <= cutoff}
+    for p in pieces:
+        if p["kind"] == "ins" and p["src"] in refs:
+            refs[p["src"]].append((p["a"], p["b"]))
+    live = [r for r in rows if r["number"] > cutoff and r["status"] == "active"]
+    live_deleted: dict[int, list[dict]] = {}
+    for r in live:
+        dp = db.loads_pieces(r["deleted_pieces"])
+        live_deleted[r["number"]] = dp
+        for p in dp:
+            if p["kind"] == "ins" and p["src"] in refs:
+                refs[p["src"]].append((p["a"], p["b"]))
+
+    # 压缩写入文本，建立旧偏移 -> 新偏移映射
+    cleared = 0
+    new_texts: dict[int, str] = {}
+    maps: dict[int, list[tuple[int, int, int]]] = {}
+    for n, spans in refs.items():
+        old = texts[n]
+        mapped = engine.compact_spans(spans, len(old))
+        maps[n] = mapped
+        new_texts[n] = "".join(old[a:b] for a, b, _ in mapped)
+        cleared += _utf8(old) - _utf8(new_texts[n])
+
+    def remap_piece(p: dict) -> dict:
+        if p["kind"] == "ins" and p["src"] in maps:
+            m = maps[p["src"]]
+            p = dict(p)
+            p["a"] = engine.remap_offset(m, p["a"])
+            p["b"] = engine.remap_offset(m, p["b"])
+        return p
+
+    db.save_pieces(conn, doc_id, [remap_piece(p) for p in pieces])
+
+    # 截止号以后未撤回勘误的还原材料同步重映射
+    for r in live:
+        conn.execute(
+            "UPDATE corrections SET deleted_pieces = ?"
+            " WHERE document_id = ? AND number = ?",
+            (db.dumps_pieces([remap_piece(p) for p in live_deleted[r["number"]]]),
+             doc_id, r["number"]),
+        )
+
+    # 截止号及以前：标封存、写回压缩文本、清掉被替换文本副本与还原材料
+    for r in rows:
+        n = r["number"]
+        if n > cutoff:
+            continue
+        if n > sealed_through:
+            cleared += _utf8(r["deleted_text"])
+        conn.execute(
+            "UPDATE corrections SET sealed = 1, text = ?, deleted_text = '',"
+            " deleted_pieces = '[]' WHERE document_id = ? AND number = ?",
+            (new_texts[n], doc_id, n),
+        )
+
+    conn.execute(
+        "UPDATE documents SET sealed_through = ? WHERE id = ?", (cutoff, doc_id))
+
+    # 不变量：封存前后现稿与标注状态必须相同，否则整体回滚
+    after = get_version(conn, doc_id)
+    for key in ("text", "valid_entities", "pending_entities"):
+        if after[key] != before[key]:
+            raise engine.InvariantError(f"封存后{key}发生变化")
+
+    new_revision = _bump_revision(conn, doc_id)
+    return {
+        "document_id": doc_id,
+        "sealed_through": cutoff,
+        "revision": new_revision,
+        "cleared_bytes": cleared,
+    }
 
 
 # ---------------------------------------------------------------- 查询
@@ -213,6 +335,7 @@ def list_corrections(conn: sqlite3.Connection, doc_id: int) -> list[dict]:
             "range_end": r["range_end"],
             "deleted_text": r["deleted_text"],
             "status": r["status"],
+            "sealed": bool(r["sealed"]),
             "touches_corrections": cmap.get(r["number"], []),
             "created_at": r["created_at"],
         }
@@ -223,7 +346,7 @@ def list_corrections(conn: sqlite3.Connection, doc_id: int) -> list[dict]:
 def list_documents(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         """
-        SELECT d.id, d.revision, d.created_at,
+        SELECT d.id, d.revision, d.sealed_through, d.created_at,
                length(d.original_text) AS original_length,
                (SELECT COUNT(*) FROM entities e WHERE e.document_id = d.id) AS entity_count,
                (SELECT COUNT(*) FROM corrections c
@@ -284,3 +407,7 @@ def _bump_revision(conn: sqlite3.Connection, doc_id: int) -> int:
     conn.execute("UPDATE documents SET revision = revision + 1 WHERE id = ?", (doc_id,))
     return conn.execute(
         "SELECT revision FROM documents WHERE id = ?", (doc_id,)).fetchone()["revision"]
+
+
+def _utf8(s: str) -> int:
+    return len(s.encode("utf-8"))

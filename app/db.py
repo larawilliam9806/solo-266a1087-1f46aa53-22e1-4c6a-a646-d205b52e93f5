@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS documents (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     original_text TEXT NOT NULL,
     revision      INTEGER NOT NULL DEFAULT 0,
+    sealed_through INTEGER NOT NULL DEFAULT 0, -- 封存线：该勘误号及以前已封存
     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS entities (
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS corrections (
     deleted_text   TEXT NOT NULL DEFAULT '', -- 本笔删掉的文本（审计用）
     deleted_pieces TEXT NOT NULL,            -- JSON，撤回时据此还原
     status         TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retracted')),
+    sealed         INTEGER NOT NULL DEFAULT 0, -- 已封存：禁止撤回，还原材料已清理
     created_at     TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (document_id, number)
 );
@@ -65,6 +67,14 @@ CREATE TABLE IF NOT EXISTS entity_effects (
 );
 """
 
+# 既有库的列补齐：(表, 新列, DDL)
+MIGRATIONS = (
+    ("documents", "sealed_through",
+     "ALTER TABLE documents ADD COLUMN sealed_through INTEGER NOT NULL DEFAULT 0"),
+    ("corrections", "sealed",
+     "ALTER TABLE corrections ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0"),
+)
+
 
 def db_path() -> str:
     return os.environ.get("DB_PATH", "app.db")
@@ -77,6 +87,10 @@ def init_db() -> None:
         os.makedirs(directory, exist_ok=True)
     conn = connect()
     conn.executescript(SCHEMA)
+    for table, column, ddl in MIGRATIONS:
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(ddl)
     conn.commit()
     conn.close()
 

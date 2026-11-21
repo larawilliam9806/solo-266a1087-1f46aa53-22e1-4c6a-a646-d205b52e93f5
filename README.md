@@ -2,7 +2,8 @@
 
 FastAPI + SQLite 实现的转录稿勘误版本管理服务。支持：导入正文与带编号的人名/
 地名标注、按当前版应用勘误（左闭右开区间替换，含插入与删除）、按勘误号撤回
-（带冲突检测）、标注待复核跟踪、实体检索，以及同一版本的一致性查询。
+（带冲突检测）、标注待复核跟踪、实体检索、同一版本的一致性查询，以及一轮校订
+结束后的勘误封存（定稿清理）。
 
 ## 启动
 
@@ -39,6 +40,13 @@ python3 -m unittest discover -s tests -p 'test_engine.py'   # 仅引擎（零依
   待复核；影响它的勘误全部撤回后自动恢复有效。落在标注边界上的插入不算。
 - **版本查询**：正文、有效标注的当前字符区间、待复核标注在同一次读事务中
   返回，并附单调递增的 `revision`，保证三者来自同一版。
+- **封存**：一轮校订结束后，提交所见版号与截止勘误号，把该号及以前的勘误
+  定稿：保留原号与原状态、标为已封存、禁止撤回；清掉这些勘误保存的被替换
+  文本副本（含还原材料），它们写入的文字中，凡现稿或截止号以后未撤回勘误
+  的还原材料仍引用的字符保留，其余清除。封存前后现稿与标注状态相同，截止
+  号以后的勘误仍按原规则撤回。版号过期返回 `409`，封存线与数据保持原样；
+  每次封存的截止号必须大于上次（封存线只推进）。成功后版号递增，返回本次
+  清掉的勘误文本字节数（按 UTF-8 计）。
 
 ## API 一览
 
@@ -49,6 +57,7 @@ python3 -m unittest discover -s tests -p 'test_engine.py'   # 仅引擎（零依
 | GET | `/documents/{doc}` | 版本查询：正文 + 有效标注区间 + 待复核标注 |
 | POST | `/documents/{doc}/corrections` | 应用勘误，返回勘误号 |
 | POST | `/documents/{doc}/corrections/{n}/retract` | 按号撤回（冲突 409） |
+| POST | `/documents/{doc}/seal` | 封存：截止号及以前勘误定稿，清理无用文本（版号过期 409） |
 | GET | `/documents/{doc}/corrections` | 勘误流水（含状态与触及关系） |
 | GET | `/documents/{doc}/entities?kind=&q=` | 实体检索（按人名/地名、名称子串） |
 | GET | `/documents/{doc}/entities/{number}` | 单个实体 |
@@ -83,6 +92,16 @@ curl -X POST localhost:8000/documents/1/corrections/1/retract
 
 # 5. 实体检索
 curl 'localhost:8000/documents/1/entities?kind=place&q=北京'
+```
+
+封存示例（一轮校订结束，定稿到勘误 2 为止）：
+
+```bash
+curl -X POST localhost:8000/documents/1/seal \
+  -H 'Content-Type: application/json' \
+  -d '{"revision": 3, "cutoff": 2}'
+# => {"document_id": 1, "sealed_through": 2, "revision": 4, "cleared_bytes": 12}
+# 勘误 1、2 标为已封存、禁止撤回；现稿与标注状态不变，勘误 3 起仍可撤回
 ```
 
 冲突示例：勘误 1 插入 `XYZ`，勘误 2 改掉了其中的 `Y`，此时撤回勘误 1：
